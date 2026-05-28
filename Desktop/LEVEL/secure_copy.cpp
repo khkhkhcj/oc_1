@@ -12,6 +12,8 @@
 #include <sys/mman.h>
 #include <signal.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "lib.h"
 
 #ifndef WORKERS_COUNT
@@ -235,10 +237,224 @@ static void print_stats(const char *mode, const std::vector<CopyTask> &tasks, do
     printf("========================\n\n");
 }
 
+// ─── Image (practice 6) ───────────────────────────────────────────────────────
+
+#pragma pack(push, 1)
+struct ImageRecord {
+    uint32_t file_len;
+    uint32_t name_len;
+    uint8_t  salt[16];
+};
+#pragma pack(pop)
+
+static void gen_salt(uint8_t *salt, size_t n) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t seed = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec
+                  + (uint64_t)(uintptr_t)salt;
+    for (size_t i = 0; i < n; i++) {
+        seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+        salt[i] = (uint8_t)(seed & 0xFF);
+    }
+}
+
+static void collect_files(const std::string &real, const std::string &virt,
+                           std::vector<std::pair<std::string,std::string>> &out) {
+    struct stat st;
+    if (stat(real.c_str(), &st) != 0) { perror(real.c_str()); return; }
+    if (S_ISREG(st.st_mode)) { out.push_back({real, virt}); return; }
+    if (!S_ISDIR(st.st_mode)) return;
+    DIR *d = opendir(real.c_str());
+    if (!d) { perror(real.c_str()); return; }
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (strcmp(e->d_name,".") == 0 || strcmp(e->d_name,"..") == 0) continue;
+        collect_files(real + "/" + e->d_name, virt + "/" + e->d_name, out);
+    }
+    closedir(d);
+}
+
+struct AddTask {
+    std::string real_path;
+    std::string virt_name;
+    std::vector<unsigned char> encrypted;
+    uint8_t salt[16];
+    int result;
+};
+
+static void *add_worker(void *arg) {
+    AddTask *t = static_cast<AddTask *>(arg);
+    std::vector<unsigned char> buf;
+    if (!read_file(t->real_path, buf)) { t->result = -1; return nullptr; }
+
+    gen_salt(t->salt, 16);
+
+    std::vector<unsigned char> composed;
+    key_use([&](const unsigned char *k, size_t klen) {
+        composed.insert(composed.end(), k, k + klen);
+    });
+    composed.insert(composed.end(), t->salt, t->salt + 16);
+
+    t->encrypted.resize(buf.size());
+    rc4_cipher(buf.data(), t->encrypted.data(), buf.size(),
+               composed.data(), composed.size());
+    t->result = 0;
+    return nullptr;
+}
+
+static int cmd_add(const std::string &img_path, const std::vector<std::string> &inputs) {
+    std::vector<std::pair<std::string,std::string>> files;
+    for (auto &inp : inputs) {
+        struct stat st;
+        if (stat(inp.c_str(), &st) != 0) { perror(inp.c_str()); continue; }
+        std::string base = inp;
+        if (base.back() == '/') base.pop_back();
+        size_t p = base.find_last_of("/\\");
+        std::string bname = (p == std::string::npos) ? base : base.substr(p+1);
+        if (S_ISDIR(st.st_mode)) collect_files(inp, "/" + bname, files);
+        else files.push_back({inp, "/" + bname});
+    }
+    if (files.empty()) { fprintf(stderr, "No files to add\n"); return 1; }
+
+    std::vector<AddTask> tasks(files.size());
+    for (size_t i = 0; i < files.size(); i++) {
+        tasks[i].real_path = files[i].first;
+        tasks[i].virt_name = files[i].second;
+        tasks[i].result    = 0;
+    }
+
+    // parallel encrypt, max 5 threads
+    size_t idx = 0;
+    while (idx < tasks.size()) {
+        int batch = (int)(tasks.size() - idx) < 5 ? (int)(tasks.size() - idx) : 5;
+        std::vector<pthread_t> th(batch);
+        for (int i = 0; i < batch; i++)
+            pthread_create(&th[i], nullptr, add_worker, &tasks[idx+i]);
+        for (int i = 0; i < batch; i++) pthread_join(th[i], nullptr);
+        idx += batch;
+    }
+
+    FILE *img = fopen(img_path.c_str(), "ab");
+    if (!img) { perror(img_path.c_str()); return 1; }
+    for (auto &t : tasks) {
+        if (t.result != 0) { fprintf(stderr, "Skip: %s\n", t.real_path.c_str()); continue; }
+        ImageRecord rec;
+        rec.file_len = (uint32_t)t.encrypted.size();
+        rec.name_len = (uint32_t)t.virt_name.size();
+        memcpy(rec.salt, t.salt, 16);
+        fwrite(&rec, sizeof(rec), 1, img);
+        fwrite(t.virt_name.c_str(), 1, rec.name_len, img);
+        fwrite(t.encrypted.data(), 1, rec.file_len, img);
+        printf("  added: %s (%u bytes)\n", t.virt_name.c_str(), rec.file_len);
+    }
+    fclose(img);
+    return 0;
+}
+
+static int cmd_list(const std::string &img_path) {
+    FILE *img = fopen(img_path.c_str(), "rb");
+    if (!img) { perror(img_path.c_str()); return 1; }
+    struct Entry { std::string name; uint32_t size; };
+    std::vector<Entry> entries;
+    ImageRecord rec;
+    while (fread(&rec, sizeof(rec), 1, img) == 1) {
+        std::string name(rec.name_len, '\0');
+        if (fread(&name[0], 1, rec.name_len, img) != rec.name_len) break;
+        fseek(img, rec.file_len, SEEK_CUR);
+        entries.push_back({name, rec.file_len});
+    }
+    fclose(img);
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry &a, const Entry &b){ return a.name < b.name; });
+    printf("%-50s  %10s\n", "Name", "Size");
+    printf("%-50s  %10s\n", std::string(50,'-').c_str(), "----------");
+    for (auto &e : entries) printf("%-50s  %10u\n", e.name.c_str(), e.size);
+    return 0;
+}
+
+static int cmd_get(const std::string &img_path, const std::string &file_name,
+                   const std::string &out_path) {
+    FILE *img = fopen(img_path.c_str(), "rb");
+    if (!img) { perror(img_path.c_str()); return 1; }
+    ImageRecord rec;
+    while (fread(&rec, sizeof(rec), 1, img) == 1) {
+        std::string name(rec.name_len, '\0');
+        if (fread(&name[0], 1, rec.name_len, img) != rec.name_len) break;
+        if (name != file_name) { fseek(img, rec.file_len, SEEK_CUR); continue; }
+        std::vector<unsigned char> enc(rec.file_len);
+        if (fread(enc.data(), 1, rec.file_len, img) != rec.file_len) break;
+        fclose(img);
+
+        std::vector<unsigned char> composed;
+        key_use([&](const unsigned char *k, size_t klen) {
+            composed.insert(composed.end(), k, k + klen);
+        });
+        composed.insert(composed.end(), rec.salt, rec.salt + 16);
+
+        std::vector<unsigned char> dec(rec.file_len);
+        rc4_cipher(enc.data(), dec.data(), rec.file_len,
+                   composed.data(), composed.size());
+        if (!write_file(out_path, dec)) { perror(out_path.c_str()); return 1; }
+        printf("Saved to %s\n", out_path.c_str());
+        return 0;
+    }
+    fclose(img);
+    fprintf(stderr, "File '%s' not found in image\n", file_name.c_str());
+    return 1;
+}
+
+static std::string get_arg(int argc, char *argv[], const char *name) {
+    for (int i = 1; i < argc - 1; i++)
+        if (strcmp(argv[i], name) == 0) return argv[i+1];
+    return "";
+}
+
+static bool has_flag(int argc, char *argv[], const char *name) {
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], name) == 0) return true;
+    return false;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[]) {
-    // Usage: secure_copy [--mode=sequential|parallel|auto] <key> <out_dir> <file> ...
+    // image mode
+    if (has_flag(argc, argv, "-add") || has_flag(argc, argv, "-list") ||
+        has_flag(argc, argv, "-get")) {
+        std::string img_path = get_arg(argc, argv, "-image");
+        if (img_path.empty()) { fprintf(stderr, "-image required\n"); return 1; }
+
+        if (has_flag(argc, argv, "-list")) return cmd_list(img_path);
+
+        std::string key_str = get_arg(argc, argv, "-key");
+        if (key_str.empty()) { fprintf(stderr, "-key required\n"); return 1; }
+        key_init(key_str.c_str());
+
+        int rc = 0;
+        if (has_flag(argc, argv, "-add")) {
+            std::vector<std::string> inputs;
+            for (int i = 1; i < argc; i++) {
+                if (strcmp(argv[i],"-add")==0 || strcmp(argv[i],"-list")==0 ||
+                    strcmp(argv[i],"-get")==0) continue;
+                if (strcmp(argv[i],"-image")==0 || strcmp(argv[i],"-key")==0 ||
+                    strcmp(argv[i],"-out")==0) { i++; continue; }
+                inputs.push_back(argv[i]);
+            }
+            rc = cmd_add(img_path, inputs);
+        } else {
+            std::string out_path = get_arg(argc, argv, "-out");
+            std::string fname    = argv[argc-1];
+            if (out_path.empty() || fname.empty()) {
+                fprintf(stderr, "Usage: -get -image img -key k -out result filename\n");
+                key_destroy(); return 1;
+            }
+            rc = cmd_get(img_path, fname, out_path);
+        }
+        key_destroy();
+        return rc;
+    }
+
+    // copy mode
     if (argc < 4) {
         fprintf(stderr,
             "Usage: %s [--mode=sequential|parallel|auto] <key> <out_dir> <file> ...\n",
