@@ -1,23 +1,14 @@
-CXX = g++
-CXXFLAGS = -Wall -Wextra -pedantic -fPIC
+CXX      = g++
+CXXFLAGS = -Wall -Wextra -pedantic -std=c++17 -pthread
+TARGET   = secure_copy
+SRCS     = secure_copy.cpp lib.cpp
 
-LIB = libcaesar.so
-TEST = test_program
+all: $(TARGET)
 
-all: $(LIB)
-
-$(LIB): libcaesar.cpp libcaesar.h
-	$(CXX) $(CXXFLAGS) -shared -o $(LIB) libcaesar.cpp
-
-install: $(LIB)
-	sudo cp $(LIB) /usr/local/lib/
-	sudo ldconfig
-
-test: $(TEST)
-	./$(TEST) ./libcaesar.so A input.txt output.txt
-
-$(TEST): test_program.cpp
-	$(CXX) $(CXXFLAGS) -ldl -o $(TEST) test_program.cpp
+$(TARGET): $(SRCS) lib.h
+	$(CXX) $(CXXFLAGS) -o $@ $(SRCS)
 
 clean:
-	rm -f $(LIB) $(TEST) output.txt
+	rm -f $(TARGET) *.enc *.log *.img
+
+.PHONY: all clean
