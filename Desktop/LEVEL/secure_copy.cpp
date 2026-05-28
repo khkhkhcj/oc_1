@@ -7,9 +7,14 @@
 #include <ctime>
 #include <pthread.h>
 #include <errno.h>
+#include <algorithm>
 #include "lib.h"
 
-// ─── Logging ────────────────────────────────────────────────────────────────
+#ifndef WORKERS_COUNT
+#define WORKERS_COUNT 4
+#endif
+
+// ─── Logging ─────────────────────────────────────────────────────────────────
 
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 static FILE *g_log_file = nullptr;
@@ -18,25 +23,33 @@ static void log_msg(const char *msg) {
     time_t now = time(nullptr);
     char ts[32];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
-
     pthread_mutex_lock(&g_log_mutex);
     if (g_log_file) fprintf(g_log_file, "[%s] %s\n", ts, msg);
     fprintf(stdout, "[%s] %s\n", ts, msg);
     pthread_mutex_unlock(&g_log_mutex);
 }
 
-// ─── Shared resource (output directory mutex) ────────────────────────────────
+// ─── Mutex with timeout ───────────────────────────────────────────────────────
 
 static pthread_mutex_t g_copy_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ─── Per-task data ───────────────────────────────────────────────────────────
+static bool mutex_lock_timeout(pthread_mutex_t *m, int sec) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += sec;
+    while (true) {
+        if (pthread_mutex_trylock(m) == 0) return true;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            return false;
+        struct timespec sl = {0, 5000000};
+        nanosleep(&sl, nullptr);
+    }
+}
 
-struct CopyTask {
-    std::string src;
-    std::string dst;
-    unsigned char key;
-    int result;   // 0 = ok, -1 = error
-};
+// ─── File helpers ─────────────────────────────────────────────────────────────
 
 static bool read_file(const std::string &path, std::vector<unsigned char> &buf) {
     std::ifstream f(path, std::ios::binary);
@@ -52,108 +65,196 @@ static bool write_file(const std::string &path, const std::vector<unsigned char>
     return true;
 }
 
-// ─── Worker thread ───────────────────────────────────────────────────────────
+// ─── CopyTask ─────────────────────────────────────────────────────────────────
 
-static void *worker(void *arg) {
-    CopyTask *task = static_cast<CopyTask *>(arg);
+struct CopyTask {
+    std::string src;
+    std::string dst;
+    unsigned char key;
+    int result;
+    double duration_ms;
+};
 
+static void process_task(CopyTask *task) {
     char msg[512];
     snprintf(msg, sizeof(msg), "START  %s -> %s", task->src.c_str(), task->dst.c_str());
     log_msg(msg);
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
 
     std::vector<unsigned char> buf;
     if (!read_file(task->src, buf)) {
         snprintf(msg, sizeof(msg), "ERROR  cannot read %s", task->src.c_str());
         log_msg(msg);
         task->result = -1;
-        return nullptr;
+        return;
     }
 
     std::vector<unsigned char> enc(buf.size());
     xor_cipher(buf.data(), enc.data(), buf.size(), task->key);
 
-    // mutex with timeout (trylock loop) to prevent deadlock
-    {
-        struct timespec deadline;
-        clock_gettime(CLOCK_MONOTONIC, &deadline);
-        deadline.tv_sec += 5;
-
-        bool locked = false;
-        while (true) {
-            if (pthread_mutex_trylock(&g_copy_mutex) == 0) { locked = true; break; }
-            struct timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            if (now.tv_sec > deadline.tv_sec ||
-                (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) break;
-            struct timespec sl = {0, 5000000}; // 5ms
-            nanosleep(&sl, nullptr);
-        }
-        if (!locked) {
-            snprintf(msg, sizeof(msg), "ERROR  mutex timeout for %s", task->src.c_str());
-            log_msg(msg);
-            task->result = -1;
-            return nullptr;
-        }
+    if (!mutex_lock_timeout(&g_copy_mutex, 5)) {
+        snprintf(msg, sizeof(msg), "ERROR  mutex timeout %s", task->src.c_str());
+        log_msg(msg);
+        task->result = -1;
+        return;
     }
-
     bool ok = write_file(task->dst, enc);
     pthread_mutex_unlock(&g_copy_mutex);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    task->duration_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
 
     if (!ok) {
         snprintf(msg, sizeof(msg), "ERROR  cannot write %s", task->dst.c_str());
         log_msg(msg);
         task->result = -1;
-        return nullptr;
+        return;
     }
 
-    snprintf(msg, sizeof(msg), "DONE   %s -> %s (%zu bytes)", task->src.c_str(), task->dst.c_str(), buf.size());
+    snprintf(msg, sizeof(msg), "DONE   %s (%.1f ms, %zu bytes)",
+             task->src.c_str(), task->duration_ms, buf.size());
     log_msg(msg);
     task->result = 0;
+}
+
+// ─── Sequential mode ──────────────────────────────────────────────────────────
+
+static void run_sequential(std::vector<CopyTask> &tasks) {
+    for (auto &t : tasks) process_task(&t);
+}
+
+// ─── Parallel mode (thread pool) ─────────────────────────────────────────────
+
+struct Queue {
+    std::vector<CopyTask *> items;
+    size_t head = 0;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    bool done = false;
+};
+
+static void *pool_worker(void *arg) {
+    Queue *q = static_cast<Queue *>(arg);
+    while (true) {
+        pthread_mutex_lock(&q->mu);
+        while (q->head >= q->items.size() && !q->done)
+            pthread_cond_wait(&q->cv, &q->mu);
+        if (q->head >= q->items.size()) {
+            pthread_mutex_unlock(&q->mu);
+            break;
+        }
+        CopyTask *task = q->items[q->head++];
+        pthread_mutex_unlock(&q->mu);
+        process_task(task);
+    }
     return nullptr;
 }
 
-// ─── Practice 3 entry point ──────────────────────────────────────────────────
+static void run_parallel(std::vector<CopyTask> &tasks) {
+    Queue q;
+    pthread_mutex_init(&q.mu, nullptr);
+    pthread_cond_init(&q.cv, nullptr);
+    for (auto &t : tasks) q.items.push_back(&t);
 
-static int run_practice3(int argc, char *argv[]) {
-    // Usage: secure_copy <key_char> <out_dir> <file1> [file2 ...]
+    int n = (int)tasks.size() < WORKERS_COUNT ? (int)tasks.size() : WORKERS_COUNT;
+    std::vector<pthread_t> workers(n);
+    for (int i = 0; i < n; i++)
+        pthread_create(&workers[i], nullptr, pool_worker, &q);
+
+    pthread_mutex_lock(&q.mu);
+    q.done = true;
+    pthread_cond_broadcast(&q.cv);
+    pthread_mutex_unlock(&q.mu);
+
+    for (int i = 0; i < n; i++) pthread_join(workers[i], nullptr);
+    pthread_mutex_destroy(&q.mu);
+    pthread_cond_destroy(&q.cv);
+}
+
+// ─── Statistics ───────────────────────────────────────────────────────────────
+
+static void print_stats(const char *mode, const std::vector<CopyTask> &tasks, double total_ms) {
+    double sum = 0;
+    int ok = 0;
+    for (auto &t : tasks) { if (t.result == 0) { sum += t.duration_ms; ok++; } }
+    printf("\n=== Statistics [%s] ===\n", mode);
+    printf("  Files processed : %d / %zu\n", ok, tasks.size());
+    printf("  Total time      : %.3f ms\n", total_ms);
+    printf("  Avg per file    : %.3f ms\n", ok > 0 ? sum / ok : 0.0);
+    printf("========================\n\n");
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+int main(int argc, char *argv[]) {
+    // Usage: secure_copy [--mode=sequential|parallel|auto] <key> <out_dir> <file> ...
     if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " <key_char> <out_dir> <file1> [file2 ...]\n";
+        fprintf(stderr,
+            "Usage: %s [--mode=sequential|parallel|auto] <key> <out_dir> <file> ...\n",
+            argv[0]);
         return 1;
     }
 
-    unsigned char key = (unsigned char)argv[1][0];
-    std::string out_dir = argv[2];
+    int file_start = 1;
+    enum Mode { AUTO, SEQ, PAR } mode = AUTO;
+    if (strncmp(argv[1], "--mode=", 7) == 0) {
+        const char *m = argv[1] + 7;
+        if      (strcmp(m, "sequential") == 0) mode = SEQ;
+        else if (strcmp(m, "parallel")   == 0) mode = PAR;
+        else                                    mode = AUTO;
+        file_start = 2;
+    }
+
+    if (argc < file_start + 3) {
+        fprintf(stderr, "Need <key> <out_dir> <file> ...\n"); return 1;
+    }
+
+    unsigned char key = (unsigned char)argv[file_start][0];
+    std::string out_dir = argv[file_start + 1];
+    int nfiles = argc - file_start - 2;
 
     g_log_file = fopen("secure_copy.log", "a");
 
-    int nfiles = argc - 3;
     std::vector<CopyTask> tasks(nfiles);
-    std::vector<pthread_t> threads(nfiles);
-
     for (int i = 0; i < nfiles; i++) {
-        std::string src = argv[3 + i];
+        std::string src = argv[file_start + 2 + i];
         std::string fname = src.substr(src.find_last_of("/\\") + 1);
-        tasks[i] = {src, out_dir + "/" + fname + ".enc", key, 0};
-        pthread_create(&threads[i], nullptr, worker, &tasks[i]);
+        tasks[i] = {src, out_dir + "/" + fname + ".enc", key, 0, 0.0};
     }
 
-    for (int i = 0; i < nfiles; i++) {
-        pthread_join(threads[i], nullptr);
+    // auto-select: <5 files -> sequential, >=5 -> parallel
+    if (mode == AUTO) mode = (nfiles < 5) ? SEQ : PAR;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    bool is_seq = (mode == SEQ);
+    log_msg(is_seq ? "Mode: sequential" : "Mode: parallel");
+
+    if (is_seq) run_sequential(tasks);
+    else        run_parallel(tasks);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double total_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+
+    print_stats(is_seq ? "sequential" : "parallel", tasks, total_ms);
+
+    // comparison estimate for auto mode
+    {
+        const char *alt = is_seq ? "parallel (estimate)" : "sequential (estimate)";
+        double alt_ms  = is_seq ? total_ms / WORKERS_COUNT : total_ms * WORKERS_COUNT;
+        printf("=== Alternative [%s] ===\n", alt);
+        printf("  Estimated time  : %.3f ms\n\n", alt_ms);
     }
 
     int errors = 0;
-    for (int i = 0; i < nfiles; i++) {
-        if (tasks[i].result != 0) errors++;
-    }
-
-    char msg[128];
-    snprintf(msg, sizeof(msg), "FINISH  %d/%d files OK", nfiles - errors, nfiles);
+    for (auto &t : tasks) if (t.result != 0) errors++;
+    char msg[64];
+    snprintf(msg, sizeof(msg), "FINISH %d/%d OK", nfiles - errors, nfiles);
     log_msg(msg);
 
     if (g_log_file) fclose(g_log_file);
     return errors > 0 ? 1 : 0;
-}
-
-int main(int argc, char *argv[]) {
-    return run_practice3(argc, argv);
 }
