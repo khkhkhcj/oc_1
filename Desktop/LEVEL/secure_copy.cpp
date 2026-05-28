@@ -8,11 +8,58 @@
 #include <pthread.h>
 #include <errno.h>
 #include <algorithm>
+#include <functional>
+#include <sys/mman.h>
+#include <signal.h>
+#include <unistd.h>
 #include "lib.h"
 
 #ifndef WORKERS_COUNT
 #define WORKERS_COUNT 4
 #endif
+
+// ─── Secure key (mmap + mprotect) ────────────────────────────────────────────
+
+static void *g_key_page = MAP_FAILED;
+static size_t g_key_len  = 0;
+
+static void sigsegv_handler(int, siginfo_t *, void *) {
+    const char *m = "\n[SECURITY] Illegal write to protected key memory. Aborting.\n";
+    write(STDERR_FILENO, m, strlen(m));
+    _exit(2);
+}
+
+static void key_init(const char *key) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sigsegv_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, nullptr);
+
+    long pgsz = sysconf(_SC_PAGESIZE);
+    g_key_len  = strlen(key);
+    g_key_page = mmap(nullptr, pgsz, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (g_key_page == MAP_FAILED) { perror("mmap"); exit(1); }
+    memcpy(g_key_page, key, g_key_len);
+    mprotect(g_key_page, pgsz, PROT_NONE);
+}
+
+static void key_use(std::function<void(const unsigned char *, size_t)> fn) {
+    long pgsz = sysconf(_SC_PAGESIZE);
+    mprotect(g_key_page, pgsz, PROT_READ);
+    fn(static_cast<const unsigned char *>(g_key_page), g_key_len);
+    mprotect(g_key_page, pgsz, PROT_NONE);
+}
+
+static void key_destroy() {
+    if (g_key_page == MAP_FAILED) return;
+    long pgsz = sysconf(_SC_PAGESIZE);
+    mprotect(g_key_page, pgsz, PROT_READ | PROT_WRITE);
+    memset(g_key_page, 0, pgsz);
+    munmap(g_key_page, pgsz);
+    g_key_page = MAP_FAILED;
+}
 
 // ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -70,7 +117,6 @@ static bool write_file(const std::string &path, const std::vector<unsigned char>
 struct CopyTask {
     std::string src;
     std::string dst;
-    unsigned char key;
     int result;
     double duration_ms;
 };
@@ -92,7 +138,10 @@ static void process_task(CopyTask *task) {
     }
 
     std::vector<unsigned char> enc(buf.size());
-    xor_cipher(buf.data(), enc.data(), buf.size(), task->key);
+    key_use([&](const unsigned char *k, size_t klen) {
+        xor_cipher(buf.data(), enc.data(), buf.size(), k[0]);
+        (void)klen;
+    });
 
     if (!mutex_lock_timeout(&g_copy_mutex, 5)) {
         snprintf(msg, sizeof(msg), "ERROR  mutex timeout %s", task->src.c_str());
@@ -211,17 +260,18 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Need <key> <out_dir> <file> ...\n"); return 1;
     }
 
-    unsigned char key = (unsigned char)argv[file_start][0];
+    const char *key_str = argv[file_start];
     std::string out_dir = argv[file_start + 1];
     int nfiles = argc - file_start - 2;
 
+    key_init(key_str);
     g_log_file = fopen("secure_copy.log", "a");
 
     std::vector<CopyTask> tasks(nfiles);
     for (int i = 0; i < nfiles; i++) {
         std::string src = argv[file_start + 2 + i];
         std::string fname = src.substr(src.find_last_of("/\\") + 1);
-        tasks[i] = {src, out_dir + "/" + fname + ".enc", key, 0, 0.0};
+        tasks[i] = {src, out_dir + "/" + fname + ".enc", 0, 0.0};
     }
 
     // auto-select: <5 files -> sequential, >=5 -> parallel
@@ -256,5 +306,6 @@ int main(int argc, char *argv[]) {
     log_msg(msg);
 
     if (g_log_file) fclose(g_log_file);
+    key_destroy();
     return errors > 0 ? 1 : 0;
 }
