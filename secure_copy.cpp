@@ -24,6 +24,7 @@
 
 static void *g_key_page = MAP_FAILED;
 static size_t g_key_len  = 0;
+static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void sigsegv_handler(int, siginfo_t *, void *) {
     const char *m = "\n[SECURITY] Illegal write to protected key memory. Aborting.\n";
@@ -49,9 +50,11 @@ static void key_init(const char *key) {
 
 static void key_use(std::function<void(const unsigned char *, size_t)> fn) {
     long pgsz = sysconf(_SC_PAGESIZE);
+    pthread_mutex_lock(&g_key_mutex);
     mprotect(g_key_page, pgsz, PROT_READ);
     fn(static_cast<const unsigned char *>(g_key_page), g_key_len);
     mprotect(g_key_page, pgsz, PROT_NONE);
+    pthread_mutex_unlock(&g_key_mutex);
 }
 
 static void key_destroy() {
